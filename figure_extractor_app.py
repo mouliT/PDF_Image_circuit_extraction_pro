@@ -47,6 +47,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -1599,6 +1600,176 @@ class ExtractionWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# SchematicIslandWorker  (Stage 2b) — extract circuit islands on schematics
+# ---------------------------------------------------------------------------
+
+class SchematicIslandWorker(QThread):
+    """Extract schematic circuit islands from vector PDFs (beta)."""
+
+    progress     = pyqtSignal(int, int)   # current, total
+    figure_ready = pyqtSignal(dict)       # reuse UI card dict
+    log          = pyqtSignal(str)
+    finished     = pyqtSignal()
+    error        = pyqtSignal(str)
+
+    def __init__(
+        self,
+        jobs: list,          # list of (pdf_path: Path, short_code: str)
+        output_dir: Path,
+        dpi: int,
+        min_size: int,
+        page_range: "tuple[int, int] | None" = None,
+        debug_overlay: bool = True,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._jobs = jobs
+        self._output_dir = output_dir
+        self._dpi = dpi
+        self._min_size = min_size
+        self._page_range = page_range
+        self._debug_overlay = debug_overlay
+
+    def run(self):
+        try:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.error.emit(f"Cannot create output directory:\n{exc}")
+            return
+
+        try:
+            from schematic_islands import (
+                find_islands_on_page,
+                render_island_png,
+                render_islands_overlay,
+            )
+        except Exception as exc:
+            self.error.emit(f"Cannot import schematic_islands.py:\n{exc}")
+            return
+
+        total = self._count_total_islands(find_islands_on_page)
+        done = 0
+
+        for pdf_path, short_code in self._jobs:
+            if self.isInterruptionRequested():
+                break
+
+            self.log.emit(f"Opening  [{short_code}]: {pdf_path.name}")
+            try:
+                doc = fitz.open(str(pdf_path))
+            except Exception as exc:
+                self.log.emit(f"ERROR opening {pdf_path.name}: {exc}")
+                continue
+
+            start_idx = 0
+            end_idx = len(doc) - 1
+            if self._page_range:
+                start_page, end_page = self._page_range
+                start_idx = max(0, start_page - 1)
+                end_idx = min(len(doc) - 1, end_page - 1)
+                if start_idx > end_idx:
+                    self.log.emit(
+                        f"  WARN  [{short_code}] page range {start_page}-{end_page} "
+                        f"is outside this PDF ({len(doc)} pages)"
+                    )
+                    doc.close()
+                    continue
+
+            for page_num in range(start_idx, end_idx + 1):
+                if self.isInterruptionRequested():
+                    break
+                page = doc[page_num]
+
+                try:
+                    islands = find_islands_on_page(
+                        page,
+                        merge_margin_pt=1.2,
+                        min_bbox_px=max(40, self._min_size),
+                        output_dpi=self._dpi,
+                    )
+                except Exception as exc:
+                    self.log.emit(f"  WARN  island detection failed page {page_num+1}: {exc}")
+                    continue
+
+                if self._debug_overlay and islands:
+                    try:
+                        overlay_name = f"{short_code}_page{page_num+1:02d}_islands_overlay.png"
+                        render_islands_overlay(
+                            page,
+                            islands,
+                            self._output_dir / overlay_name,
+                            dpi=min(250, self._dpi),
+                        )
+                    except Exception as exc:
+                        self.log.emit(f"  WARN  overlay failed page {page_num+1}: {exc}")
+
+                for isl in islands:
+                    if self.isInterruptionRequested():
+                        break
+                    done += 1
+                    self.progress.emit(done, total)
+
+                    base_name = f"{short_code}_Island{isl.island_index}_page{page_num+1:02d}.png"
+                    out_path = _make_unique_path(self._output_dir, base_name)
+
+                    try:
+                        w, h = render_island_png(page, isl, out_path, dpi=self._dpi)
+                    except Exception as exc:
+                        self.log.emit(f"  WARN  save failed {base_name}: {exc}")
+                        continue
+
+                    self.figure_ready.emit({
+                        "path": str(out_path),
+                        "fname": out_path.name,
+                        "page": page_num + 1,
+                        "dims": f"{w} x {h}",
+                        "paper_num": short_code,
+                        "paper_name": pdf_path.name,
+                        "fig_num": isl.island_index,
+                        "fig_id": f"island:{page_num+1}:{isl.island_index}",
+                        "confidence": 0.0,
+                        "classification": "UNKNOWN",
+                        "pdf_path": str(pdf_path),
+                        "page_num": page_num,
+                        "dpi": self._dpi,
+                        "crop_rect": None,
+                        "source": "schematic_island",
+                    })
+
+            doc.close()
+
+        self.finished.emit()
+
+    def _count_total_islands(self, find_islands_on_page_fn) -> int:
+        total = 0
+        for pdf_path, _ in self._jobs:
+            try:
+                doc = fitz.open(str(pdf_path))
+                start_idx = 0
+                end_idx = len(doc) - 1
+                if self._page_range:
+                    start_page, end_page = self._page_range
+                    start_idx = max(0, start_page - 1)
+                    end_idx = min(len(doc) - 1, end_page - 1)
+                    if start_idx > end_idx:
+                        doc.close()
+                        continue
+                for page_num in range(start_idx, end_idx + 1):
+                    page = doc[page_num]
+                    islands = find_islands_on_page_fn(
+                        page,
+                        merge_margin_pt=1.2,
+                        min_bbox_px=max(40, self._min_size),
+                        output_dpi=self._dpi,
+                    )
+                    total += len(islands)
+                doc.close()
+            except Exception:
+                pass
+        return max(total, 1)
+
+
+# ---------------------------------------------------------------------------
 # SingleFigureWorker  (Stage 5) — re-extract one figure in background
 # ---------------------------------------------------------------------------
 
@@ -1715,6 +1886,7 @@ class ControlPanel(QWidget):
     """
 
     queue_changed = pyqtSignal(int)   # emits file count on every queue change
+    mode_changed  = pyqtSignal(str)   # 'figures' | 'islands'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1745,6 +1917,9 @@ class ControlPanel(QWidget):
 
     def min_size(self) -> int:
         return self._minsize_spin.value()
+
+    def mode(self) -> str:
+        return "islands" if self._mode_combo.currentIndex() == 1 else "figures"
 
     def page_range(self) -> "tuple[int, int] | None":
         """Return (start_page, end_page) in 1-indexed inclusive form.
@@ -1788,6 +1963,7 @@ class ControlPanel(QWidget):
             self._add_pdf_btn,
             self._add_folder_btn,
             self._clear_btn,
+            self._mode_combo,
             self._dpi_spin,
             self._minsize_spin,
             self._page_from_spin,
@@ -1827,6 +2003,25 @@ class ControlPanel(QWidget):
         toolbar.addWidget(self._clear_btn)
         toolbar.addStretch()
 
+        mode_label = QLabel("Mode:")
+        mode_label.setObjectName("sectionLabel")
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItems([
+            "Figures (captions)",
+            "Schematic islands (beta)",
+        ])
+        self._mode_combo.setToolTip(
+            "Figures: caption-driven extraction (Fig./Figure).\n"
+            "Schematic islands: vector-stroke island extraction for schematics."
+        )
+        self._mode_combo.currentIndexChanged.connect(
+            lambda _: self.mode_changed.emit(self.mode())
+        )
+
+        toolbar.addWidget(mode_label)
+        toolbar.addWidget(self._mode_combo)
+        toolbar.addSpacing(10)
+
         dpi_label = QLabel("DPI:")
         dpi_label.setObjectName("sectionLabel")
         self._dpi_spin = QSpinBox()
@@ -1841,7 +2036,10 @@ class ControlPanel(QWidget):
         self._minsize_spin.setRange(20, 500)
         self._minsize_spin.setValue(80)
         self._minsize_spin.setSuffix(" px")
-        self._minsize_spin.setToolTip("Minimum figure dimension to keep (default 80 px)")
+        self._minsize_spin.setToolTip(
+            "Figures: minimum extracted figure dimension (px).\n"
+            "Islands: minimum island bounding-box dimension (px)."
+        )
 
         toolbar.addWidget(dpi_label)
         toolbar.addWidget(self._dpi_spin)
@@ -2994,6 +3192,7 @@ class MainWindow(QMainWindow):
         # Control panel
         self.control_panel = ControlPanel()
         self.control_panel.queue_changed.connect(self._on_queue_changed)
+        self.control_panel.mode_changed.connect(self._on_mode_changed)
         main_layout.addWidget(self.control_panel)
 
         # Separator
@@ -3063,6 +3262,22 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready  —  add PDFs to begin")
+
+        # Initial mode setup
+        self._on_mode_changed(self.control_panel.mode())
+
+    def _on_mode_changed(self, mode: str):
+        if mode == "islands":
+            self.extract_btn.setText("EXTRACT ISLANDS")
+            self.ctx_btn.setEnabled(False)
+            self.ctx_btn.setToolTip("Context generation is available for caption-based figure extraction only.")
+        else:
+            self.extract_btn.setText("EXTRACT FIGURES")
+            # Context button is enabled only after a successful extraction
+            self.ctx_btn.setToolTip(
+                "Write one P{N}_context.md per paper into the output folder.\n"
+                "Feed that file + the PNG images to Claude to generate Feynman tutorials."
+            )
 
     # ------------------------------------------------------------------
     # Queue change
@@ -3187,6 +3402,7 @@ class MainWindow(QMainWindow):
         min_size   = self.control_panel.min_size()
         page_range = self.control_panel.page_range()
         page_text  = self.control_panel.page_range_text()
+        mode       = self.control_panel.mode()
 
         # Jobs use user-defined short codes — queue order is preserved
         jobs = [(p, code) for p, code in entries]
@@ -3204,15 +3420,32 @@ class MainWindow(QMainWindow):
         self._set_extracting(True)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Scanning… %v / %m")
+        action = "Extracting figures" if mode == "figures" else "Extracting islands"
         self.status_bar.showMessage(
             (
-                f"Extracting from {len(jobs)} PDF(s)  →  {output_dir}"
+                f"{action} from {len(jobs)} PDF(s)  →  {output_dir}"
                 if page_text == "all pages"
-                else f"Extracting from {len(jobs)} PDF(s)  →  {output_dir}  ({page_text})"
+                else f"{action} from {len(jobs)} PDF(s)  →  {output_dir}  ({page_text})"
             )
         )
 
-        self._worker = ExtractionWorker(jobs, output_dir, dpi, min_size, page_range=page_range)
+        if mode == "islands":
+            self._worker = SchematicIslandWorker(
+                jobs,
+                output_dir,
+                dpi,
+                min_size,
+                page_range=page_range,
+                debug_overlay=True,
+            )
+        else:
+            self._worker = ExtractionWorker(
+                jobs,
+                output_dir,
+                dpi,
+                min_size,
+                page_range=page_range,
+            )
         self._worker.progress.connect(self._on_progress)
         self._worker.figure_ready.connect(self._on_figure_ready)
         self._worker.log.connect(self._on_worker_log)

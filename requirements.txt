@@ -1,0 +1,5 @@
+PyMuPDF==1.27.1
+numpy==2.4.2
+Pillow==12.1.1
+PyQt6
+shapely==2.0.6
