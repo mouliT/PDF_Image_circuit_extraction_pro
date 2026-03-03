@@ -1683,8 +1683,7 @@ class SchematicIslandWorker(QThread):
                 try:
                     islands = find_islands_on_page(
                         page,
-                        merge_margin_pt=1.2,
-                        min_bbox_px=max(40, self._min_size),
+                        min_bbox_px=max(120, self._min_size),
                         output_dpi=self._dpi,
                     )
                 except Exception as exc:
@@ -1758,8 +1757,7 @@ class SchematicIslandWorker(QThread):
                     page = doc[page_num]
                     islands = find_islands_on_page_fn(
                         page,
-                        merge_margin_pt=1.2,
-                        min_bbox_px=max(40, self._min_size),
+                        min_bbox_px=max(120, self._min_size),
                         output_dpi=self._dpi,
                     )
                     total += len(islands)
