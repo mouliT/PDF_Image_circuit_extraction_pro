@@ -29,5 +29,5 @@ Thumbs.db
 figures/
 output/
 schematic_island_outputs*/
-temp_tests/
+temp_tests*/
 schematic_density_test/
