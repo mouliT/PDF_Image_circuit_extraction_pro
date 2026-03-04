@@ -26,6 +26,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 import numpy as np
+from PIL import Image, ImageDraw
 
 try:
     from figure_quality import FigureQualityStandard, FigureMetrics, QualityEvaluator
@@ -404,6 +405,25 @@ QPushButton#subfigBtn {
 QPushButton#subfigBtn:hover   { background-color: #3a5a3a; border-color: #6ab86a; }
 QPushButton#subfigBtn:pressed  { background-color: #1e2e1e; }
 QPushButton#subfigBtn:disabled {
+    background-color: #2d2d2d;
+    color: #555555;
+    border-color: #3c3c3c;
+}
+QPushButton#eraseBtn {
+    background-color: #2d1a1a;
+    color: #dc5034;
+    border: 1px solid #8b2020;
+    font-weight: bold;
+    min-height: 24px;
+    border-radius: 4px;
+}
+QPushButton#eraseBtn:hover   { background-color: #3d2020; border-color: #c0392b; }
+QPushButton#eraseBtn:checked {
+    background: #8b2020;
+    color: #ffffff;
+    border: 1px solid #c0392b;
+}
+QPushButton#eraseBtn:disabled {
     background-color: #2d2d2d;
     color: #555555;
     border-color: #3c3c3c;
@@ -1630,6 +1650,12 @@ class SchematicIslandWorker(QThread):
         self._page_range = page_range
         self._debug_overlay = debug_overlay
 
+        # Map each PDF to its .kicad_sch sibling (or None if not found)
+        self._kicad_map: dict = {}
+        for pdf_path, _ in jobs:
+            sch = pdf_path.with_suffix(".kicad_sch")
+            self._kicad_map[pdf_path] = sch if sch.exists() else None
+
     def run(self):
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -1639,6 +1665,7 @@ class SchematicIslandWorker(QThread):
 
         try:
             from schematic_islands import (
+                find_islands_kicad,
                 find_islands_on_page,
                 render_island_png,
                 render_islands_overlay,
@@ -1647,14 +1674,19 @@ class SchematicIslandWorker(QThread):
             self.error.emit(f"Cannot import schematic_islands.py:\n{exc}")
             return
 
-        total = self._count_total_islands(find_islands_on_page)
+        # For KiCad-mode PDFs, island count is not known upfront — use a
+        # generous placeholder so the progress bar isn't stuck at 0/0.
+        total = self._estimate_total(find_islands_on_page)
         done = 0
 
         for pdf_path, short_code in self._jobs:
             if self.isInterruptionRequested():
                 break
 
-            self.log.emit(f"Opening  [{short_code}]: {pdf_path.name}")
+            sch_path = self._kicad_map.get(pdf_path)
+            mode_tag = f"KiCad [{sch_path.name}]" if sch_path else "raster fallback"
+            self.log.emit(f"Opening  [{short_code}]: {pdf_path.name}  ({mode_tag})")
+
             try:
                 doc = fitz.open(str(pdf_path))
             except Exception as exc:
@@ -1681,11 +1713,21 @@ class SchematicIslandWorker(QThread):
                 page = doc[page_num]
 
                 try:
-                    islands = find_islands_on_page(
-                        page,
-                        min_bbox_px=max(120, self._min_size),
-                        output_dpi=self._dpi,
-                    )
+                    if sch_path:
+                        self.log.emit(f"  [KiCad] parsing {sch_path.name}, page {page_num+1}")
+                        islands = find_islands_kicad(
+                            sch_path,
+                            page,
+                            min_bbox_px=max(120, self._min_size),
+                            output_dpi=self._dpi,
+                        )
+                    else:
+                        self.log.emit(f"  [raster] page {page_num+1}")
+                        islands = find_islands_on_page(
+                            page,
+                            min_bbox_px=max(120, self._min_size),
+                            output_dpi=self._dpi,
+                        )
                 except Exception as exc:
                     self.log.emit(f"  WARN  island detection failed page {page_num+1}: {exc}")
                     continue
@@ -1717,6 +1759,17 @@ class SchematicIslandWorker(QThread):
                         self.log.emit(f"  WARN  save failed {base_name}: {exc}")
                         continue
 
+                    # Derive crop_rect: KiCad islands store pdf_rect directly;
+                    # raster islands use their pixel bbox converted to PDF points.
+                    if isl.pdf_rect is not None:
+                        crop_rect_val = isl.pdf_rect
+                    else:
+                        _s = isl.dpi / 72.0
+                        crop_rect_val = (
+                            isl.bbox[0] / _s, isl.bbox[1] / _s,
+                            isl.bbox[2] / _s, isl.bbox[3] / _s,
+                        )
+
                     self.figure_ready.emit({
                         "path": str(out_path),
                         "fname": out_path.name,
@@ -1731,7 +1784,7 @@ class SchematicIslandWorker(QThread):
                         "pdf_path": str(pdf_path),
                         "page_num": page_num,
                         "dpi": self._dpi,
-                        "crop_rect": None,
+                        "crop_rect": crop_rect_val,
                         "source": "schematic_island",
                     })
 
@@ -1739,7 +1792,13 @@ class SchematicIslandWorker(QThread):
 
         self.finished.emit()
 
-    def _count_total_islands(self, find_islands_on_page_fn) -> int:
+    def _estimate_total(self, find_islands_on_page_fn) -> int:
+        """Return an island count estimate for the progress bar.
+
+        KiCad-mode PDFs are skipped (count unknown upfront); each page
+        contributes a placeholder of 5 so the bar moves smoothly.
+        Raster-mode PDFs are pre-scanned exactly as before.
+        """
         total = 0
         for pdf_path, _ in self._jobs:
             try:
@@ -1753,14 +1812,19 @@ class SchematicIslandWorker(QThread):
                     if start_idx > end_idx:
                         doc.close()
                         continue
-                for page_num in range(start_idx, end_idx + 1):
-                    page = doc[page_num]
-                    islands = find_islands_on_page_fn(
-                        page,
-                        min_bbox_px=max(120, self._min_size),
-                        output_dpi=self._dpi,
-                    )
-                    total += len(islands)
+                n_pages = end_idx - start_idx + 1
+                if self._kicad_map.get(pdf_path):
+                    # KiCad mode: placeholder — actual count known after parsing
+                    total += n_pages * 5
+                else:
+                    for page_num in range(start_idx, end_idx + 1):
+                        page = doc[page_num]
+                        islands = find_islands_on_page_fn(
+                            page,
+                            min_bbox_px=max(120, self._min_size),
+                            output_dpi=self._dpi,
+                        )
+                        total += len(islands)
                 doc.close()
             except Exception:
                 pass
@@ -2143,9 +2207,11 @@ class ControlPanel(QWidget):
 
     def _on_clear_all(self):
         self._queue_rows.clear()
-        # Remove all row widgets from layout (keep empty label and stretch)
+        # Remove all row widgets from layout.
+        # Layout order: [0] empty_label  [1..N] rows  [N+1] stretch
+        # takeAt(1) removes rows without touching the empty label at index 0.
         while self._queue_layout.count() > 2:
-            item = self._queue_layout.takeAt(0)
+            item = self._queue_layout.takeAt(1)
             if item.widget():
                 item.widget().deleteLater()
         self._refresh_queue()
@@ -2173,6 +2239,20 @@ class ControlPanel(QWidget):
         name_label.setObjectName("queueRowName")
         name_label.setToolTip(str(path))
 
+        # KiCad badge — shown when a .kicad_sch sibling exists
+        sch_sibling = path.with_suffix(".kicad_sch")
+        kicad_badge = QLabel("+KiCad") if sch_sibling.exists() else None
+        if kicad_badge:
+            kicad_badge.setObjectName("kicadBadge")
+            kicad_badge.setStyleSheet(
+                "QLabel#kicadBadge {"
+                "  color: #00c896; font-size: 10px; font-weight: bold;"
+                "  border: 1px solid #00c896; border-radius: 3px;"
+                "  padding: 0px 4px;"
+                "}"
+            )
+            kicad_badge.setToolTip(f"KiCad schematic found: {sch_sibling.name}")
+
         # Short-code editor
         code_edit = QLineEdit()
         code_edit.setObjectName("queueRowCode")
@@ -2187,6 +2267,8 @@ class ControlPanel(QWidget):
         remove_btn.clicked.connect(lambda _, p=path, w=row_widget: self._remove_row(p, w))
 
         row_layout.addWidget(name_label, stretch=1)
+        if kicad_badge:
+            row_layout.addWidget(kicad_badge)
         row_layout.addWidget(code_edit)
         row_layout.addWidget(remove_btn)
 
@@ -2198,6 +2280,7 @@ class ControlPanel(QWidget):
     def _remove_row(self, path: Path, row_widget):
         """Remove a single PDF row from the queue."""
         self._queue_rows = [(p, e) for p, e in self._queue_rows if p != path]
+        self._queue_layout.removeWidget(row_widget)
         row_widget.deleteLater()
         self._refresh_queue()
 
@@ -2228,12 +2311,15 @@ class ImageCropWidget(QWidget):
     crop_selected    = pyqtSignal(float, float, float, float)
     edge_drag_started = pyqtSignal(str)           # 'top'|'bottom'|'left'|'right'
     edge_drag_moved   = pyqtSignal(str, float)    # edge, cumulative fraction from drag start
+    erase_region_requested = pyqtSignal(float, float, float, float)  # x0,y0,x1,y1 fracs [0-1]
 
     _HANDLE_SZ  = 7
     _HANDLE_W   = 14   # pixel hit-zone half-width around each edge
     _SEL_COLOR  = QColor(86, 156, 214)
     _SEL_FILL   = QColor(86, 156, 214, 40)
     _EDGE_COLOR = QColor(78, 201, 176)            # teal tab colour
+    _ERASE_COLOR = QColor(220, 80, 60)            # orange-red border in erase mode
+    _ERASE_FILL  = QColor(220, 80, 60, 50)        # translucent fill
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2250,6 +2336,8 @@ class ImageCropWidget(QWidget):
         self.setMinimumSize(100, 80)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.CrossCursor)
+        self._erase_mode = False
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
     # ---------------------------------------------------------------- public
 
@@ -2271,6 +2359,12 @@ class ImageCropWidget(QWidget):
         self._dragging_edge = None
         self._drag_start_pos = None
         self._drag_current_pos = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def set_erase_mode(self, enabled: bool):
+        self._erase_mode = enabled
+        self.clear_selection()
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.update()
 
@@ -2329,17 +2423,19 @@ class ImageCropWidget(QWidget):
         if self._sel_rect and not self._sel_rect.isEmpty():
             sel = self._sel_rect.intersected(self._img_rect)
             if not sel.isEmpty():
+                sel_color = self._ERASE_COLOR if self._erase_mode else self._SEL_COLOR
+                sel_fill  = self._ERASE_FILL  if self._erase_mode else self._SEL_FILL
                 # Semi-transparent fill
-                painter.fillRect(sel, self._SEL_FILL)
+                painter.fillRect(sel, sel_fill)
                 # Dashed border
-                pen = QPen(self._SEL_COLOR, 2, Qt.PenStyle.DashLine)
+                pen = QPen(sel_color, 2, Qt.PenStyle.DashLine)
                 painter.setPen(pen)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(sel)
                 # Corner handles
                 hs = self._HANDLE_SZ
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(self._SEL_COLOR)
+                painter.setBrush(sel_color)
                 for hx, hy in [
                     (sel.left(),  sel.top()),
                     (sel.right(), sel.top()),
@@ -2356,14 +2452,30 @@ class ImageCropWidget(QWidget):
                         w_frac = sel.width()  / iw
                         h_frac = sel.height() / ih
                         dim_text = f"{w_frac*100:.0f}% × {h_frac*100:.0f}%"
-                        painter.setPen(self._SEL_COLOR)
+                        painter.setPen(sel_color)
                         painter.drawText(sel, Qt.AlignmentFlag.AlignCenter, dim_text)
+
+        # Erase mode hint text (when no selection drawn yet)
+        if self._erase_mode and not self._sel_rect and self._pixmap:
+            painter.setPen(QColor(220, 80, 60, 180))
+            f = painter.font()
+            f.setPointSize(9)
+            painter.setFont(f)
+            painter.drawText(self._img_rect,
+                             Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
+                             "Draw rect  ·  Delete to erase")
 
     # -------------------------------------------------------------- mouse
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._pixmap:
             pos = event.pos()
+            if self._erase_mode:
+                if self._img_rect.contains(pos):
+                    self._sel_start = pos
+                    self._sel_rect  = None
+                    self._dragging  = True
+                return
             # Edge drag takes priority over interior crop selection
             edge = self._edge_at(pos)
             if edge:
@@ -2435,6 +2547,10 @@ class ImageCropWidget(QWidget):
                 self.update()
                 super().mouseReleaseEvent(event)
                 return
+            if self._erase_mode:
+                self._dragging = False
+                self.update()   # keep _sel_rect visible — user still needs to press Delete
+                return
             if self._dragging:
                 self._dragging = False
                 if self._sel_rect and self._sel_rect.width() > 4 and self._sel_rect.height() > 4:
@@ -2476,6 +2592,28 @@ class ImageCropWidget(QWidget):
             min(1.0, x1), min(1.0, y1),
         )
 
+    def keyPressEvent(self, event):
+        if (self._erase_mode
+                and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+                and self._sel_rect
+                and self._sel_rect.width() > 4
+                and self._sel_rect.height() > 4):
+            self._emit_erase()
+        else:
+            super().keyPressEvent(event)
+
+    def _emit_erase(self):
+        if not self._sel_rect or self._img_rect.width() == 0:
+            return
+        r, ir = self._sel_rect, self._img_rect
+        x0 = max(0.0, (r.left()   - ir.left()) / ir.width())
+        y0 = max(0.0, (r.top()    - ir.top())  / ir.height())
+        x1 = min(1.0, (r.right()  - ir.left()) / ir.width())
+        y1 = min(1.0, (r.bottom() - ir.top())  / ir.height())
+        if x1 > x0 and y1 > y0:
+            self.erase_region_requested.emit(x0, y0, x1, y1)
+        self.clear_selection()
+
 
 # ---------------------------------------------------------------------------
 # Placeholder panels  (replaced in Stages 3 & 4)
@@ -2511,6 +2649,7 @@ class PreviewPanel(QWidget):
         self._current_data: dict | None = None
         self._edge_drag_start_vals: dict = {}
         self._exp: dict[str, float] = {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0}
+        self._erase_history: list[tuple] = []   # (x0,y0,x1,y1) fracs per erase op
         self._build_ui()
 
     def _build_ui(self):
@@ -2641,6 +2780,21 @@ class PreviewPanel(QWidget):
         dpi_btn_row.addWidget(self._subfig_btn)
         crop_vbox.addLayout(dpi_btn_row)
 
+        erase_row = QHBoxLayout()
+        erase_row.setSpacing(6)
+        self._erase_btn = QPushButton("Erase Region")
+        self._erase_btn.setObjectName("eraseBtn")
+        self._erase_btn.setCheckable(True)
+        self._erase_btn.setEnabled(False)
+        self._erase_btn.setToolTip(
+            "Toggle erase mode.\n"
+            "Draw a rectangle over any region, then press Delete to white it out.\n"
+            "Saved directly to the PNG — cannot be undone."
+        )
+        erase_row.addStretch()
+        erase_row.addWidget(self._erase_btn)
+        crop_vbox.addLayout(erase_row)
+
         # Keyboard shortcut: Ctrl+Enter triggers re-extract
         # Note: Qt distinguishes Return vs Enter (numpad). Register both.
         self._reextract_sc_return = QShortcut(QKeySequence("Ctrl+Return"), self)
@@ -2662,6 +2816,8 @@ class PreviewPanel(QWidget):
 
         # Refresh delta label when DPI changes
         self._reex_dpi_sb.valueChanged.connect(self._update_delta_label)
+        self._erase_btn.toggled.connect(self._on_erase_mode_toggled)
+        self._crop_widget.erase_region_requested.connect(self._on_erase_region)
 
     # ---- Public API ----
 
@@ -2683,6 +2839,9 @@ class PreviewPanel(QWidget):
         has_crop = bool(data.get("crop_rect"))
         self._reex_btn.setEnabled(has_crop)
         self._subfig_btn.setEnabled(has_crop)
+        self._erase_history = []
+        self._erase_btn.setChecked(False)
+        self._erase_btn.setEnabled(True)
 
     def clear(self):
         self._current_data = None
@@ -2696,6 +2855,8 @@ class PreviewPanel(QWidget):
         self._update_delta_label()
         self._reex_btn.setEnabled(False)
         self._subfig_btn.setEnabled(False)
+        self._erase_btn.setChecked(False)
+        self._erase_btn.setEnabled(False)
 
     def refresh_path(self, new_path: str, new_fname: str):
         """Update internal state after a rename."""
@@ -2732,17 +2893,52 @@ class PreviewPanel(QWidget):
         self._update_delta_label()
         # Force-reload the image (Qt caches pixmaps by path — must clear)
         QPixmapCache.clear()
+        # Re-apply any erased regions (re-extract overwrites the PNG from PDF)
+        if self._erase_history and self._current_data:
+            self._apply_erase_history(self._current_data["path"])
         self._crop_widget.set_pixmap(QPixmap(self._current_data["path"]))
         # set_pixmap already calls clear_selection — no extra call needed
 
+    def _apply_erase_history(self, path: str):
+        img  = Image.open(path).convert("RGB")
+        w, h = img.size
+        draw = ImageDraw.Draw(img)
+        for x0, y0, x1, y1 in self._erase_history:
+            draw.rectangle(
+                [int(x0 * w), int(y0 * h), int(x1 * w) - 1, int(y1 * h) - 1],
+                fill=(255, 255, 255),
+            )
+        img.save(path)
+
     def set_reextracting(self, active: bool):
-        self._reex_btn.setEnabled(not active)
+        has_crop = bool(self._current_data and self._current_data.get("crop_rect"))
+        self._reex_btn.setEnabled(not active and has_crop)
         self._reset_btn.setEnabled(not active)
-        # Sub-fig button: restore enabled state based on whether data is loaded
-        if not active and self._current_data:
-            self._subfig_btn.setEnabled("crop_rect" in self._current_data)
-        else:
-            self._subfig_btn.setEnabled(False)
+        self._subfig_btn.setEnabled(not active and has_crop)
+        self._erase_btn.setEnabled(not active)
+
+    def _on_erase_mode_toggled(self, checked: bool):
+        self._crop_widget.set_erase_mode(checked)
+        if checked:
+            self._crop_widget.setFocus()
+
+    def _on_erase_region(self, x0_frac: float, y0_frac: float,
+                         x1_frac: float, y1_frac: float):
+        if not self._current_data:
+            return
+        self._erase_history.append((x0_frac, y0_frac, x1_frac, y1_frac))
+        path = self._current_data["path"]
+        img  = Image.open(path).convert("RGB")
+        w, h = img.size
+        px0 = int(x0_frac * w)
+        py0 = int(y0_frac * h)
+        px1 = int(x1_frac * w)
+        py1 = int(y1_frac * h)
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([px0, py0, px1 - 1, py1 - 1], fill=(255, 255, 255))
+        img.save(path)
+        QPixmapCache.clear()
+        self._crop_widget.set_pixmap(QPixmap(path))
 
     def _on_edge_drag_started(self, edge: str):
         """Snapshot spinbox values at the start of an edge drag."""
@@ -2760,7 +2956,7 @@ class PreviewPanel(QWidget):
         `frac` is cumulative from the drag-start (positive = expanding outward).
         Delta in PDF points = frac × dimension_of_crop_rect_in_pts.
         """
-        if not self._current_data or "crop_rect" not in self._current_data:
+        if not self._current_data or not self._current_data.get("crop_rect"):
             return
         x0, y0, x1, y1 = self._current_data["crop_rect"]
         ref_pt   = (y1 - y0) if edge in ('top', 'bottom') else (x1 - x0)
@@ -2783,7 +2979,7 @@ class PreviewPanel(QWidget):
             expand_left   = current_x0 - new_x0   (neg = trim left)
             expand_right  = new_x1    - current_x1 (neg = trim right)
         """
-        if not self._current_data or "crop_rect" not in self._current_data:
+        if not self._current_data or not self._current_data.get("crop_rect"):
             return
         x0, y0, x1, y1 = self._current_data["crop_rect"]
         w_pt = x1 - x0
@@ -3409,6 +3605,7 @@ class MainWindow(QMainWindow):
         self._last_jobs       = jobs
         self._last_output_dir = output_dir
         self._figures_by_paper.clear()
+        self._subfig_counts.clear()   # reset sub-figure counters for this new run
         self.ctx_btn.setEnabled(False)
 
         self.thumbnail_gallery.clear_all()
